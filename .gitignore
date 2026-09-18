@@ -13,3 +13,9 @@
 MyRoleNameTag.png
 
 
+# Jev experiment: local secrets, environments and observations
+.env
+.env.*
+.venv/
+artifacts/
+*.pyc
