@@ -134,7 +134,8 @@ class GuardedActionHandler:
             self.keyboard.halt()
             return
         valid = (isinstance(action, str) and isinstance(params, dict) and
-                 ((action in DIRECTIONS and params.get("direction") in DIRECTIONS[action])
+                 ((action in DIRECTIONS and isinstance(params.get("direction"), str)
+                   and params["direction"] in DIRECTIONS[action])
                   or (isinstance(action, str) and action.startswith("HEAL_")
                       and isinstance(params.get("key"), str) and bool(params["key"]))))
         if not valid:
@@ -146,3 +147,4 @@ class GuardedActionHandler:
         except Exception:
             self.keyboard.halt()
             raise
+
