@@ -1,0 +1,63 @@
+name: Jev policy checks
+on:
+  push:
+    branches: [jev-policy]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      live_api:
+        description: Run one billed Jev API smoke call on synthetic data (no gameplay)
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  offline:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: '3.10'
+          - os: windows-latest
+            python: '3.12'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Compile existing code and experimental entrypoint
+        run: python -m compileall -q src jev_main.py main.py tools/check_policy.py
+      - name: Offline tests and upstream interface contract
+        run: python tools/check_policy.py --upstream
+      - name: Upload reports even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: policy-${{ matrix.os }}-py${{ matrix.python }}
+          path: artifacts/policy/
+          if-no-files-found: warn
+          retention-days: 14
+  live-api:
+    if: github.event_name == 'workflow_dispatch' && inputs.live_api
+    needs: offline
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Synthetic API contract smoke test only
+        env:
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+          JEV_MODEL: ${{ vars.JEV_MODEL || 'jev-latest' }}
+        run: python tools/check_policy.py --live
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: policy-live-api-contract
+          path: artifacts/policy/
+          retention-days: 14
