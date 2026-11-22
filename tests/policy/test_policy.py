@@ -14,7 +14,7 @@ from src.policy.client import (CRITERIA, ENDPOINT, Decision, JevClient, JevError
 from src.policy.core import FSMPolicy, JevPolicy
 from src.policy.integration import (AutoControlAdapter, ObservationBuilder, PolicyBridge,
                                     percentage, point, stop_command)
-from src.policy.input_guard import GuardedActionHandler, KeyboardLeaseMixin
+from src.policy.input_guard import HEAL_HOLD_SECONDS, GuardedActionHandler, KeyboardLeaseMixin
 
 CHOICES = ("IDLE", "PATROL")
 
@@ -374,6 +374,102 @@ class IntegrationTests(unittest.TestCase):
         self.assertIsNone(point((True, 0)))
         self.assertIsNone(point((0,)))
 
+    def test_heal_hold_is_not_preempted_and_then_expires(self):
+        heal = ("HEAL_LOW", {"key": "h"})
+        released = []
+        bridge = self.bridge("jev")
+        bridge.release_inputs = lambda: released.append("release")
+        adapter = AutoControlAdapter(self.owner, bridge, halt=lambda: released.append("halt"))
+        self.owner.health = heal
+        self.assertEqual(adapter.run(self.state), heal)
+        self.assertEqual(self.owner.skill_calls, [])
+        self.owner.health = None
+        released.clear()
+        self.clock.advance(1.0)
+        # The next frame used to become IDLE and halt the potion key.
+        self.assertEqual(adapter.run(self.state), heal)
+        self.assertEqual(released, [])
+        self.assertEqual(self.owner.skill_calls, [])
+        self.clock.advance(HEAL_HOLD_SECONDS)
+        result = adapter.run(self.state)
+        self.assertFalse(str(result[0]).startswith("HEAL"))
+
+    def test_heal_hold_suppresses_baseline_until_it_completes(self):
+        machine = self.owner.bot_state
+        bridge = self.bridge("fsm")
+        adapter = AutoControlAdapter(self.owner, bridge)
+        self.owner.health = ("HEAL_LOW", {"key": "h"})
+        adapter.run(self.state)
+        self.owner.health = None
+        self.clock.advance(0.5)
+        adapter.run(self.state)
+        self.assertEqual(machine.calls, 0)
+        self.clock.advance(HEAL_HOLD_SECONDS)
+        adapter.run(self.state)
+        self.assertEqual(machine.calls, 1)
+
+    def test_safety_stop_retries_heal_and_death_does_not(self):
+        heal = ("HEAL_LOW", {"key": "h"})
+        allowed = {"ok": True}
+        adapter = AutoControlAdapter(self.owner, self.bridge("jev"), allowed=lambda: allowed["ok"])
+        self.owner.health = heal
+        self.assertEqual(adapter.run(self.state), heal)
+        self.owner.health = None
+        self.clock.advance(0.2)
+        allowed["ok"] = False
+        self.assertEqual(adapter.run(self.state), stop_command())
+        allowed["ok"] = True
+        self.assertEqual(adapter.run(self.state), heal)
+        self.assertEqual(self.owner.skill_calls, [])
+        # Focus loss calls suspend() directly and must keep the same retry.
+        adapter.suspend()
+        self.assertEqual(adapter.run(self.state), heal)
+        self.state.player_hp = 0
+        self.assertEqual(adapter.run(self.state), stop_command())
+        self.state.player_hp = 80
+        result = adapter.run(self.state)
+        self.assertFalse(str(result[0]).startswith("HEAL"))
+
+    def test_tactic_switch_and_exit_release_held_keys(self):
+        keyboard = Keyboard(allowed=lambda: True, clock=self.clock, watchdog=False)
+        try:
+            keyboard.arm()
+            keyboard._key_down("left")
+            bridge = self.bridge("jev")
+            bridge.release_inputs = keyboard.halt
+            bridge._execute("PATROL", self.state)
+            self.assertEqual(keyboard._pressed_keys, set())
+            self.assertEqual(self.owner.skill_calls, ["PATROL"])
+            keyboard.arm()
+            keyboard._key_down("right")
+            bridge._execute("PATROL", self.state)
+            self.assertEqual(keyboard._pressed_keys, {"right"})
+            bridge._execute("COMBAT", self.state)
+            self.assertEqual(keyboard._pressed_keys, set())
+            self.assertEqual(self.owner.skill_calls, ["PATROL", "PATROL", "COMBAT"])
+            keyboard.arm()
+            keyboard._key_down("left")
+            self.assertEqual(bridge._execute("IDLE", self.state), stop_command())
+            self.assertEqual(keyboard._pressed_keys, set())
+            self.assertIsNone(bridge.last_tactic)
+            bridge._execute("NAVIGATE", self.state)
+            keyboard.arm()
+            keyboard._key_down("up")
+            self.assertEqual(bridge.handle(self.state), stop_command())
+            self.assertEqual(keyboard._pressed_keys, set())
+            self.assertIsNone(bridge.last_tactic)
+            bridge._execute("RECOVER_STUCK", self.state)
+            keyboard.arm()
+            keyboard._key_down("jump")
+            bridge.reset()
+            self.assertEqual(keyboard._pressed_keys, set())
+            self.assertIsNone(bridge.last_tactic)
+            held = len(keyboard.events)
+            bridge.reset()
+            self.assertEqual(len(keyboard.events), held)
+        finally:
+            keyboard.close()
+
 
 class KeyboardBase:
     def __init__(self):
@@ -469,6 +565,116 @@ class InputTests(unittest.TestCase):
         self.kb.arm()
         self.kb._key_down("left")
         self.assertEqual(self.kb.events, [])
+
+    def test_expired_lease_cannot_be_renewed(self):
+        self.assertTrue(self.kb.arm())
+        self.clock.advance(0.999)
+        self.assertTrue(self.kb.arm())
+        deadline = self.kb._lease_until
+        self.clock.now = deadline
+        self.assertFalse(self.kb.arm())
+        self.assertEqual(self.kb._lease_until, deadline)
+        self.kb._key_down("left")
+        self.assertEqual(self.kb.events, [])
+        self.kb.halt()
+        self.assertTrue(self.kb.arm())
+        self.kb._key_down("left")
+        self.assertEqual(self.kb.events, [("down", "left")])
+
+    def test_guard_does_not_dispatch_on_expired_lease(self):
+        calls = []
+        handler = GuardedActionHandler(
+            SimpleNamespace(execute_behavior=lambda *args: calls.append(args)), self.kb)
+        handler.execute_behavior("MOVE", {"direction": "LEFT"})
+        self.kb._key_down("left")
+        self.assertEqual(calls, [("MOVE", {"direction": "LEFT"})])
+        self.clock.advance(1.0)
+        calls.clear()
+        handler.execute_behavior("MOVE", {"direction": "RIGHT"})
+        self.assertEqual(calls, [])
+        self.assertEqual(self.kb._pressed_keys, set())
+        self.assertEqual(self.kb._lease_until, 0.0)
+        handler.execute_behavior("MOVE", {"direction": "RIGHT"})
+        self.assertEqual(calls, [("MOVE", {"direction": "RIGHT"})])
+
+    def test_heal_lease_covers_hold_and_idle_does_not_release_it(self):
+        calls = []
+        handler = GuardedActionHandler(
+            SimpleNamespace(execute_behavior=lambda *args: calls.append(args)), self.kb)
+        handler.execute_behavior("HEAL_LOW", {"key": "h"})
+        self.kb._key_down("h")
+        self.assertGreaterEqual(self.kb._lease_until - self.clock.now, HEAL_HOLD_SECONDS)
+        self.clock.advance(1.0)
+        self.assertTrue(self.kb._permitted())
+        handler.execute_behavior("IDLE", {"command": "RELEASE_ALL"})
+        handler.execute_behavior("MOVE", {"direction": "LEFT"})
+        self.assertEqual(calls, [("HEAL_LOW", {"key": "h"})])
+        self.assertEqual(self.kb._pressed_keys, {"h"})
+        self.clock.advance(HEAL_HOLD_SECONDS)
+        handler.execute_behavior("IDLE", {"command": "RELEASE_ALL"})
+        self.assertEqual(self.kb._pressed_keys, set())
+
+    def test_cancelled_heal_worker_cannot_clear_a_retried_hold(self):
+        entered = threading.Event()
+        second_entered = threading.Event()
+        release_old = threading.Event()
+        release_new = threading.Event()
+
+        class ItemKeyboard(Keyboard):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self._item_lock = threading.Lock()
+                self._status_item = False
+
+            def _item_command(self, key):
+                with self._item_lock:
+                    self._status_item = True
+                self._key_down(key)
+                try:
+                    if key == "h":
+                        entered.set()
+                        release_old.wait(2)
+                    else:
+                        second_entered.set()
+                        release_new.wait(2)
+                finally:
+                    self._key_up(key)
+                    with self._item_lock:
+                        self._status_item = False
+
+        keyboard = ItemKeyboard(allowed=lambda: True, clock=self.clock, watchdog=False)
+        old = threading.Thread(target=lambda: None)
+        new = threading.Thread(target=lambda: None)
+        try:
+            self.assertTrue(keyboard.arm(HEAL_HOLD_SECONDS))
+            old = threading.Thread(target=keyboard._item_command, args=("h",))
+            old.start()
+            self.assertTrue(entered.wait(2))
+            self.assertTrue(keyboard._status_item)
+            self.assertIn("h", keyboard._pressed_keys)
+            keyboard.halt()
+            self.assertFalse(keyboard._status_item)
+            self.assertNotIn("h", keyboard._pressed_keys)
+            self.assertTrue(keyboard.arm(HEAL_HOLD_SECONDS))
+            new = threading.Thread(target=keyboard._item_command, args=("p",))
+            new.start()
+            self.assertTrue(second_entered.wait(2))
+            self.assertTrue(keyboard._status_item)
+            self.assertIn("p", keyboard._pressed_keys)
+            release_old.set()
+            old.join(2)
+            self.assertFalse(old.is_alive())
+            self.assertTrue(keyboard._status_item)
+            self.assertIn("p", keyboard._pressed_keys)
+            self.assertNotIn("h", keyboard._pressed_keys)
+        finally:
+            release_old.set()
+            release_new.set()
+            old.join(2)
+            new.join(2)
+            keyboard.close()
+            self.assertFalse(keyboard._status_item)
+            self.assertNotIn("p", keyboard._pressed_keys)
 
 
 if __name__ == "__main__":

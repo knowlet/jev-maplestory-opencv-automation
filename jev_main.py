@@ -61,7 +61,8 @@ def main(argv=None):
                 "stuck": bool(config.get("auto_control_config.TOGGLE_Stuck_ACTION", True)),
             }
             self.bridge = PolicyBridge(self.auto_control, args.policy, client=client, settings=settings,
-                                       emit=log, capabilities=capabilities)
+                                       emit=log, capabilities=capabilities,
+                                       release_inputs=self.keyboard.halt)
             self.auto_control = AutoControlAdapter(
                 self.auto_control, self.bridge,
                 allowed=lambda: self.active() and self.loss_tracking_count == 0,

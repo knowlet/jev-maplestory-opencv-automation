@@ -94,7 +94,7 @@ Environment configuration (seconds unless stated):
 | `JEV_TIMEOUT` | `1.0` | Socket timeout and game-loop response deadline |
 | `JEV_MAX_AGE` | `1.5` | Maximum cached decision age **from observation**, not response |
 | `JEV_MIN_CONFIDENCE` | `0.35` | Initial experiment threshold, **not calibrated on this game** |
-| `JEV_INPUT_LEASE` | `1.0` | Motor-input lease renewed only by valid commands |
+| `JEV_INPUT_LEASE` | `1.0` | Motor-input lease. A valid command may grant one, or renew one that has not expired. Renewal after expiry fails until `halt` clears it |
 
 API requests use a single daemon worker slot. A delayed DNS/socket worker can
 outlive a timeout, but is ignored and occupies its slot until it exits: no
@@ -118,7 +118,24 @@ and generation-tagged worker targets so pre-pause workers cannot press after
 resume. A watchdog revokes expired input without waiting for HTTP.
 
 The same guard is applied in all three experimental modes. In particular, every
-`IDLE` releases all keys rather than only horizontal movement. Thus:
+`IDLE` releases all keys rather than only horizontal movement, except while a
+heal hold is still in progress (see below). Entering a Jev tactic, switching
+to a different Jev tactic, or leaving one — `IDLE`, a frame with no decision, a
+skill that returns no action, or reset — releases every tracked key. Repeating
+the same Jev tactic does not, so a movement key can stay down across those frames.
+
+Healing stays outside Jev and outranks tactics. After a valid heal command, the
+controller keeps returning that heal for the upstream potion-key hold (3 seconds,
+the same duration as `KeyBoard._item_command`) and arms the input lease for that
+hold so the watchdog does not release the key. In every mode, including `fsm`
+and `shadow`, baseline and Jev commands do not run during that hold. Keys held
+by the previous tactic are released when the hold starts, before the potion key
+is pressed. Pause, focus
+loss, or missing tracking releases keys; the interrupted heal is issued again
+before any tactic when control returns, and a further interruption retries it
+again. Death releases keys and does not retry the heal.
+
+Thus:
 
 * the **FSM policy implementation is unchanged**;
 * the **experimental harness is deliberately safer, not byte-for-byte behavior

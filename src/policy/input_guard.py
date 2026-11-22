@@ -3,10 +3,20 @@
 The original keyboard worker methods end in *_command. Bind their generation
 when the target is retrieved, so a pre-pause worker cannot press after resume.
 This is a best-effort application guard, not a hard-real-time driver guarantee.
+
+A lease is granted when none is held and renewed only while it is still in the
+future. Renewal after expiry fails until halt() clears it. Healing outranks
+tactical commands for the upstream potion-key hold; a safety halt can cancel
+that hold, and a later heal must be able to press again.
 """
 import functools
 import threading
 import time
+
+# KeyBoard._item_command holds a potion key for this long. A heal's input lease
+# covers the same interval so the watchdog does not release the key early, and
+# tactical commands must not preempt the hold.
+HEAL_HOLD_SECONDS = 3.0
 
 
 class KeyboardLeaseMixin:
@@ -36,14 +46,60 @@ class KeyboardLeaseMixin:
                 previous = getattr(local, "epoch", None)
                 local.epoch = epoch
                 try:
+                    if name == "_item_command":
+                        self._claim_item_owner(epoch)
                     return value(*args, **kwargs)
                 finally:
+                    if name == "_item_command":
+                        # Upstream clears _status_item in its own finally, including
+                        # after this worker was cancelled. Restore a newer hold.
+                        self._finish_item_worker(epoch)
                     if previous is None:
                         del local.epoch
                     else:
                         local.epoch = previous
             return generation_bound
         return value
+
+    def _item_state_lock(self):
+        lock = getattr(self, "_item_lock", None)
+        if lock is None or not hasattr(self, "_status_item"):
+            return None
+        return lock
+
+    def _claim_item_owner(self, epoch):
+        lock = self._item_state_lock()
+        if lock is None:
+            return
+        with lock:
+            # A worker that already lost the lease must not steal a newer heal.
+            if epoch == self._lease_epoch:
+                current = getattr(self, "_item_owner_epoch", None)
+                if current is None or current == epoch:
+                    self._item_owner_epoch = epoch
+
+    def _finish_item_worker(self, epoch):
+        lock = self._item_state_lock()
+        if lock is None:
+            return
+        with lock:
+            owner = getattr(self, "_item_owner_epoch", None)
+            if owner is None:
+                return
+            if owner == epoch:
+                self._status_item = False
+                self._item_owner_epoch = None
+                return
+            if owner == self._lease_epoch:
+                self._status_item = True
+
+    def _cancel_item_hold(self):
+        lock = self._item_state_lock()
+        if lock is None:
+            return
+        with lock:
+            self._status_item = False
+            self._item_owner_epoch = None
 
     def _permitted(self):
         try:
@@ -53,10 +109,27 @@ class KeyboardLeaseMixin:
         except Exception:
             return False
 
-    def arm(self):
+    def arm(self, seconds=None):
+        """Grant a lease, or renew one that has not expired.
+
+        Returns False when the keyboard is closed, the requested duration is not
+        usable, or the current lease has already expired. An expired lease is
+        left unchanged so a late command cannot stretch it.
+        """
         with self._lease_lock:
-            if not self._lease_closed:
-                self._lease_until = self._lease_clock() + self._lease_seconds
+            if self._lease_closed:
+                return False
+            now = self._lease_clock()
+            if self._lease_until > 0.0 and now >= self._lease_until:
+                return False
+            duration = self._lease_seconds if seconds is None else seconds
+            if type(duration) not in (int, float):
+                return False
+            duration = float(duration)
+            if duration != duration or duration <= 0.0 or duration == float("inf"):
+                return False
+            self._lease_until = now + duration
+            return True
 
     def _key_down(self, key):
         with self._lease_lock:
@@ -91,6 +164,7 @@ class KeyboardLeaseMixin:
             # an upstream timed movement worker may hold it while sleeping.
             for key in keys:
                 super()._key_up(key)
+            self._cancel_item_hold()
 
     def release_all(self):
         self.halt()
@@ -119,32 +193,70 @@ DIRECTIONS = {
 }
 
 
+def _is_heal(action, params):
+    return (isinstance(action, str) and action.startswith("HEAL_")
+            and isinstance(params, dict)
+            and isinstance(params.get("key"), str) and bool(params["key"]))
+
+
+def _accepted(action, params):
+    if not isinstance(action, str) or not isinstance(params, dict):
+        return False
+    if action in DIRECTIONS:
+        direction = params.get("direction")
+        return isinstance(direction, str) and direction in DIRECTIONS[action]
+    return _is_heal(action, params)
+
+
 class GuardedActionHandler:
     def __init__(self, handler, keyboard):
         self.handler = handler
         self.keyboard = keyboard
+        self._heal_until = 0.0
         handler.keyboard = keyboard
+
+    def _now(self):
+        return self.keyboard._lease_clock()
+
+    def _heal_in_progress(self):
+        # The hold is live only while its covering lease has not been halted.
+        now = self._now()
+        return self._heal_until > now and self.keyboard._lease_until > now
 
     def execute_behavior(self, action, params=None):
         if action is None:
             return
         params = params or {}
-        if action == "IDLE":
+        healing = _is_heal(action, params)
+        if self._heal_in_progress() and not healing:
+            # Tactical and idle commands must not release the potion key.
+            self.keyboard.arm(self._heal_until - self._now())
+            return
+        if action == "IDLE" or not _accepted(action, params):
             # For the experiment, every IDLE stops inputs, not just horizontal motion.
+            self._heal_until = 0.0
             self.keyboard.halt()
             return
-        valid = (isinstance(action, str) and isinstance(params, dict) and
-                 ((action in DIRECTIONS and isinstance(params.get("direction"), str)
-                   and params["direction"] in DIRECTIONS[action])
-                  or (isinstance(action, str) and action.startswith("HEAL_")
-                      and isinstance(params.get("key"), str) and bool(params["key"]))))
-        if not valid:
+        if healing and not self._heal_in_progress():
+            duration = HEAL_HOLD_SECONDS
+            fresh_heal = True
+        elif healing:
+            duration = self._heal_until - self._now()
+            fresh_heal = False
+        else:
+            duration = None
+            fresh_heal = False
+        if not self.keyboard.arm(duration):
+            # Expired lease: do not dispatch, and do not extend the deadline.
+            self._heal_until = 0.0
             self.keyboard.halt()
             return
-        self.keyboard.arm()
+        if fresh_heal:
+            self._heal_until = self._now() + HEAL_HOLD_SECONDS
         try:
             self.handler.execute_behavior(action, params)
         except Exception:
+            self._heal_until = 0.0
             self.keyboard.halt()
             raise
 

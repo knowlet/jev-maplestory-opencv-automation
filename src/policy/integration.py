@@ -11,6 +11,7 @@ import time
 import uuid
 
 from .core import FSMPolicy, JevPolicy
+from .input_guard import HEAL_HOLD_SECONDS
 
 
 def stop_command():
@@ -166,13 +167,19 @@ class JsonlLog:
 
 
 class PolicyBridge:
-    """Replaces only bot_state.handle; all skills execute on the game-loop thread."""
+    """Replaces only bot_state.handle; all skills execute on the game-loop thread.
+
+    Healing outranks tactics until the potion-key hold finishes. A safety stop
+    can cancel that hold; the adapter replays the heal before the next tactic.
+    Switching or leaving a tactic releases held keys before the next skill.
+    """
     def __init__(self, owner, mode, *, client=None, settings=None, clock=time.monotonic,
-                 submit=None, emit=None, capabilities=None):
+                 submit=None, emit=None, capabilities=None, release_inputs=None):
         if mode not in {"fsm", "shadow", "jev"}:
             raise ValueError("policy must be fsm, shadow or jev")
         self.owner, self.mode = owner, mode
         self.emit = emit or (lambda event: None)
+        self.release_inputs = release_inputs or (lambda: None)
         self.fsm = FSMPolicy(owner.bot_state)
         self.builder = ObservationBuilder(clock=clock, capabilities=capabilities)
         self.jev = None
@@ -183,28 +190,72 @@ class PolicyBridge:
                 raise ValueError("Jev client required")
             self.jev = JevPolicy(client, settings, clock=clock, submit=submit, emit=self._emit_jev)
         self.last_tactic = None
+        self._heal_action = None
+        self._heal_until = 0.0
 
     def _emit_jev(self, event):
         if event.get("event") == "jev_request" and self.mode == "shadow":
             event = {**event, "baseline_motor_command": self._baseline_for_log}
         self.emit(event)
 
-    def reset(self):
-        self.builder.reset()
-        self.last_tactic = None
-        if self.jev:
+    def _held_heal(self):
+        if self._heal_action is None:
+            return None
+        if self.builder.clock() < self._heal_until:
+            return self._heal_action
+        self._heal_action = None
+        self._heal_until = 0.0
+        return None
+
+    def note_heal(self, action):
+        """Start a heal hold. Repeating the same in-progress heal does not extend it."""
+        if self._held_heal() is not None:
+            return
+        self._heal_action = action
+        self._heal_until = self.builder.clock() + HEAL_HOLD_SECONDS
+        # The decision that was in flight is stale once healing takes the controller.
+        if self.jev is not None:
             self.jev.reset()
-        # Only clear Jev's motor continuation. Do not mutate the shadow FSM.
+        # Release keys held by the tactic this heal is preempting. The potion
+        # press happens afterwards, when the returned heal command is executed.
+        self.release_inputs()
+
+    def interrupt_heal(self):
+        """Drop an in-progress hold and return it so the caller can retry later."""
+        action = self._held_heal()
+        self._heal_action = None
+        self._heal_until = 0.0
+        return action
+
+    def _leave_tactic(self):
+        active = self.last_tactic is not None
+        self.last_tactic = None
         if self.mode == "jev":
             self.owner.current_verti_target = None
             self.owner._verti_movement_timer = None
+        if active:
+            self.release_inputs()
+
+    def reset(self):
+        self._heal_action = None
+        self._heal_until = 0.0
+        self.builder.reset()
+        self._leave_tactic()
+        if self.jev:
+            self.jev.reset()
 
     def close(self):
+        self._heal_action = None
+        self._heal_until = 0.0
+        self._leave_tactic()
         if self.jev:
             self.jev.close()
 
     def handle(self, state):
-        if self.mode == "fsm":
+        held = self._held_heal()
+        if held is not None:
+            result = held
+        elif self.mode == "fsm":
             result = self.fsm.decide(state)
         else:
             snapshot, choices, context = self.builder.build(state, self.owner)
@@ -221,6 +272,7 @@ class PolicyBridge:
                                "baseline_motor_command": baseline,
                                "note": "different abstractions; agreement is not accuracy"})
             elif decision is None:
+                self._leave_tactic()
                 result = stop_command()
             else:
                 result = self._execute(decision.choice, state)
@@ -232,7 +284,12 @@ class PolicyBridge:
     def _execute(self, tactic, state):
         owner = self.owner
         owner.current_platform = owner._check_current_platform()
+        if tactic == "IDLE":
+            self._leave_tactic()
+            return stop_command()
         if tactic != self.last_tactic:
+            # Drop keys held by the previous tactic before the new skill runs.
+            self.release_inputs()
             owner.current_verti_target = None
             owner._verti_movement_timer = None
         self.last_tactic = tactic
@@ -251,32 +308,61 @@ class PolicyBridge:
                 result = owner._move_to_verti_passage(target) if target is not None else stop_command()
         else:
             result = stop_command()
-        return result if result and result[0] is not None else stop_command()
+        if not result or result[0] is None or result[0] == "IDLE":
+            self._leave_tactic()
+            return stop_command()
+        return result
+
+
+def _heal_result(result):
+    if not result or not isinstance(result[0], str) or not result[0].startswith("HEAL_"):
+        return False
+    params = result[1] if isinstance(result[1], dict) else {}
+    key = params.get("key")
+    return isinstance(key, str) and bool(key)
 
 
 class AutoControlAdapter:
-    """Guard before AutoControl's health handling and cached-position reuse."""
+    """Guard before AutoControl's health handling and cached-position reuse.
+
+    Priority while the controller is allowed to run: an in-progress heal, then
+    the selected tactic. Pause, focus loss, missing tracking and death stop
+    inputs. Death discards a cancelled heal; the other stops retry it once
+    before any tactic when control returns.
+    """
     def __init__(self, owner, bridge, *, allowed=lambda: True, halt=lambda: None):
         self.owner, self.bridge = owner, bridge
         self.allowed, self.halt = allowed, halt
+        self._retry_heal = None
         owner.bot_state = bridge
 
     def get_debug_geometry(self):
         return self.owner.get_debug_geometry()
 
-    def suspend(self):
+    def suspend(self, *, retry_heal=True):
+        pending = self.bridge.interrupt_heal()
+        if not retry_heal:
+            self._retry_heal = None
+        elif pending is not None:
+            self._retry_heal = pending
         self.bridge.reset()
         self.halt()
 
     def run(self, state):
+        dead = percentage(state.player_hp) == 0
         if (not self.allowed() or point(state.mini_player_loc) is None
-                or point(state.player_center_loc) is None or percentage(state.player_hp) == 0):
-            self.suspend()
+                or point(state.player_center_loc) is None or dead):
+            self.suspend(retry_heal=not dead)
             return stop_command()
+        if self._retry_heal is not None:
+            action = self._retry_heal
+            self._retry_heal = None
+            self.bridge.note_heal(action)
+            return action
         try:
-            result = self.owner.run(state)  # original health priority is retained
-            if result and result[0] and result[0].startswith("HEAL") and self.bridge.jev:
-                self.bridge.jev.reset()
+            result = self.owner.run(state)  # health is still decided before tactics
+            if _heal_result(result):
+                self.bridge.note_heal(result)
             return result
         except Exception as exc:
             self.suspend()
