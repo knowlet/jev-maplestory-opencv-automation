@@ -31,6 +31,7 @@ class KeyboardLeaseMixin:
         self._focus_losses = 0
         self._focus_seen = 0
         self._focus_down = False
+        self._focus_lost_at = None
         self._lease_local = threading.local()
         self._lease_closed = False
         self._lease_stop = threading.Event()
@@ -49,15 +50,17 @@ class KeyboardLeaseMixin:
                 local = self._lease_local
                 previous = getattr(local, "epoch", None)
                 local.epoch = epoch
+                token = None
                 try:
                     if name == "_item_command":
-                        self._claim_item_owner(epoch)
+                        token = self._begin_item_hold()
+                        # A hold is already owned. Do not run a second potion worker.
+                        if token is None and self._item_state_lock() is not None:
+                            return None
                     return value(*args, **kwargs)
                 finally:
                     if name == "_item_command":
-                        # Upstream clears _status_item in its own finally, including
-                        # after this worker was cancelled. Restore a newer hold.
-                        self._finish_item_worker(epoch)
+                        self._finish_item_worker(token)
                     if previous is None:
                         del local.epoch
                     else:
@@ -71,30 +74,33 @@ class KeyboardLeaseMixin:
             return None
         return lock
 
-    def _claim_item_owner(self, epoch):
+    def _begin_item_hold(self):
+        """Give this potion press its own token. A busy hold is not shared."""
         lock = self._item_state_lock()
         if lock is None:
-            return
+            return None
         with lock:
-            # A worker that already lost the lease must not steal a newer heal.
-            if epoch == self._lease_epoch:
-                current = getattr(self, "_item_owner_epoch", None)
-                if current is None or current == epoch:
-                    self._item_owner_epoch = epoch
+            if getattr(self, "_item_owner_token", None) is not None:
+                return None
+            token = getattr(self, "_item_hold_serial", 0) + 1
+            self._item_hold_serial = token
+            self._item_owner_token = token
+            self._status_item = True
+            return token
 
-    def _finish_item_worker(self, epoch):
+    def _finish_item_worker(self, token):
+        """One locked update: clear the flag only if this hold still owns it."""
         lock = self._item_state_lock()
-        if lock is None:
+        if lock is None or token is None:
             return
         with lock:
-            owner = getattr(self, "_item_owner_epoch", None)
-            if owner is None:
-                return
-            if owner == epoch:
+            owner = getattr(self, "_item_owner_token", None)
+            if owner == token:
                 self._status_item = False
-                self._item_owner_epoch = None
+                self._item_owner_token = None
                 return
-            if owner == self._lease_epoch:
+            # Upstream just cleared the flag. A newer hold still owns it.
+            if owner is not None:
                 self._status_item = True
 
     def _cancel_item_hold(self):
@@ -103,7 +109,7 @@ class KeyboardLeaseMixin:
             return
         with lock:
             self._status_item = False
-            self._item_owner_epoch = None
+            self._item_owner_token = None
 
     def _permitted(self):
         try:
@@ -123,6 +129,9 @@ class KeyboardLeaseMixin:
         """
         with self._lease_lock:
             if self._lease_closed:
+                return False
+            # A focus loss the game loop has not consumed yet must not be re-armed.
+            if self._focus_losses != self._focus_seen:
                 return False
             now = self._lease_clock()
             if self._grant_blocked:
@@ -182,8 +191,17 @@ class KeyboardLeaseMixin:
             self._current_move = None
             # Synchronous key-up, bypassing cancelled-worker filtering. No move lock:
             # an upstream timed movement worker may hold it while sleeping.
+            # One driver failure must not skip the rest or escape into the watchdog.
+            failed = []
             for key in keys:
-                super()._key_up(key)
+                try:
+                    super()._key_up(key)
+                except Exception:
+                    failed.append(key)
+            if failed:
+                with self._pressed_keys_lock:
+                    for key in failed:
+                        self._pressed_keys.add(key)
             self._cancel_item_hold()
 
     def release_all(self):
@@ -204,18 +222,27 @@ class KeyboardLeaseMixin:
             elif not self._focus_down:
                 self._focus_losses += 1
                 self._focus_down = True
+                self._focus_lost_at = self._lease_clock()
             if not self._permitted():
                 self.halt()
 
     def consume_focus_losses(self):
+        """Return the clock time of an unconsumed focus loss, or None."""
         with self._lease_lock:
-            lost = self._focus_losses != self._focus_seen
+            if self._focus_losses == self._focus_seen:
+                return None
             self._focus_seen = self._focus_losses
-            return lost
+            return self._focus_lost_at
+
+    def _watch_once(self):
+        try:
+            self._poll_lease()
+        except Exception:
+            return
 
     def _watch_lease(self):
         while not self._lease_stop.wait(0.025):
-            self._poll_lease()
+            self._watch_once()
 
     def close(self):
         with self._lease_lock:

@@ -128,9 +128,12 @@ target's distance or name can change without cancelling an attack. Repeating
 that command may keep holding its keys. A missing action is returned as `IDLE`,
 so the loop releases keys instead of leaving them down. A focus loss seen by
 the input watchdog is counted even if focus has returned by the next frame; the
-game loop consumes that count and suspends before using a cached decision. An
-in-progress heal is returned before the health manager runs again, so a second
-low bar does not start until the first hold finishes. A request still running
+game loop consumes that count and suspends before using a cached decision. Until
+that count is consumed, `arm` will not grant a lease. An in-progress heal is
+returned before the health manager runs again, so a second low bar does not
+start until the first hold finishes. If inputs are cut off before that deadline,
+the heal is replayed from the interrupt time even when the loop resumes later.
+A request still running
 from before a pause is not charged as a deadline failure after resume.
 
 Healing stays outside Jev and outranks tactics. After a valid heal command, the

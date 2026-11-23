@@ -220,12 +220,20 @@ class PolicyBridge:
         # press happens afterwards, when the returned heal command is executed.
         self.release_inputs()
 
-    def interrupt_heal(self):
-        """Drop an in-progress hold and return it so the caller can retry later."""
-        action = self._held_heal()
+    def interrupt_heal(self, interrupted_at=None):
+        """Return a heal that was cut off before its hold deadline.
+
+        `interrupted_at` is when the inputs were actually released. A later
+        resume, even after the original deadline, still replays that heal.
+        """
+        action = self._heal_action
+        deadline = self._heal_until
+        when = self.builder.clock() if interrupted_at is None else interrupted_at
         self._heal_action = None
         self._heal_until = 0.0
-        return action
+        if action is not None and when < deadline:
+            return action
+        return None
 
     def _leave_tactic(self):
         active = self.last_tactic is not None
@@ -342,8 +350,8 @@ class AutoControlAdapter:
     def get_debug_geometry(self):
         return self.owner.get_debug_geometry()
 
-    def suspend(self, *, retry_heal=True):
-        pending = self.bridge.interrupt_heal()
+    def suspend(self, *, retry_heal=True, interrupted_at=None):
+        pending = self.bridge.interrupt_heal(interrupted_at=interrupted_at)
         if not retry_heal:
             self._retry_heal = None
         elif pending is not None:
@@ -354,12 +362,14 @@ class AutoControlAdapter:
     def run(self, state):
         dead = percentage(state.player_hp) == 0
         try:
-            focus_lost = bool(self.consume_focus_losses())
+            loss_at = self.consume_focus_losses()
         except Exception:
-            focus_lost = True
+            loss_at = True
+        focus_lost = loss_at is not None and loss_at is not False
+        interrupted_at = loss_at if type(loss_at) in (int, float) else None
         if (focus_lost or not self.allowed() or point(state.mini_player_loc) is None
                 or point(state.player_center_loc) is None or dead):
-            self.suspend(retry_heal=not dead)
+            self.suspend(retry_heal=not dead, interrupted_at=interrupted_at)
             return stop_command()
         # Finish the potion already in progress before the health manager can
         # start the other bar and spend its cooldown.
