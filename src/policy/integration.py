@@ -276,8 +276,9 @@ class PolicyBridge:
                 result = stop_command()
             else:
                 result = self._execute(decision.choice, state)
-        if result is None:
-            result = (None, None)
+        # A missing action used to skip the handler and leave the previous keys down.
+        if result is None or result[0] is None:
+            result = stop_command()
         self.builder.last_action = result[0]
         return result
 

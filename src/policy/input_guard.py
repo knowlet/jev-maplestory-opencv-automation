@@ -27,6 +27,7 @@ class KeyboardLeaseMixin:
         self._lease_allowed = allowed
         self._lease_until = 0.0
         self._lease_epoch = 0
+        self._grant_blocked = False
         self._lease_local = threading.local()
         self._lease_closed = False
         self._lease_stop = threading.Event()
@@ -110,16 +111,20 @@ class KeyboardLeaseMixin:
             return False
 
     def arm(self, seconds=None):
-        """Grant a lease, or renew one that has not expired.
+        """Grant a lease, or extend one that has not expired.
 
-        Returns False when the keyboard is closed, the requested duration is not
-        usable, or the current lease has already expired. An expired lease is
-        left unchanged so a late command cannot stretch it.
+        Returns False when the keyboard is closed, the duration is unusable,
+        the current lease has expired, or the previous halt cleared an expired
+        lease and that rejection has not been consumed yet. Renewal never
+        moves an active deadline earlier.
         """
         with self._lease_lock:
             if self._lease_closed:
                 return False
             now = self._lease_clock()
+            if self._grant_blocked:
+                self._grant_blocked = False
+                return False
             if self._lease_until > 0.0 and now >= self._lease_until:
                 return False
             duration = self._lease_seconds if seconds is None else seconds
@@ -128,8 +133,15 @@ class KeyboardLeaseMixin:
             duration = float(duration)
             if duration != duration or duration <= 0.0 or duration == float("inf"):
                 return False
-            self._lease_until = now + duration
+            proposed = now + duration
+            if proposed > self._lease_until:
+                self._lease_until = proposed
             return True
+
+    def acknowledge_expired_grant(self):
+        """The rejected attempt has finished. The following attempt may grant."""
+        with self._lease_lock:
+            self._grant_blocked = False
 
     def _key_down(self, key):
         with self._lease_lock:
@@ -154,11 +166,16 @@ class KeyboardLeaseMixin:
 
     def halt(self):
         with self._lease_lock:
+            now = self._lease_clock()
+            expired = self._lease_until > 0.0 and now >= self._lease_until
             with self._pressed_keys_lock:
                 keys = list(self._pressed_keys)
             if self._lease_until or keys:
                 self._lease_epoch += 1
             self._lease_until = 0.0
+            if expired:
+                # Clearing an expired lease must not let the same attempt grant again.
+                self._grant_blocked = True
             self._current_move = None
             # Synchronous key-up, bypassing cancelled-worker filtering. No move lock:
             # an upstream timed movement worker may hold it while sleeping.
@@ -199,6 +216,14 @@ def _is_heal(action, params):
             and isinstance(params.get("key"), str) and bool(params["key"]))
 
 
+def _command_signature(action, params):
+    try:
+        items = tuple(sorted(params.items()))
+    except TypeError:
+        items = tuple(params.items())
+    return (action, items)
+
+
 def _accepted(action, params):
     if not isinstance(action, str) or not isinstance(params, dict):
         return False
@@ -213,6 +238,7 @@ class GuardedActionHandler:
         self.handler = handler
         self.keyboard = keyboard
         self._heal_until = 0.0
+        self._command = None
         handler.keyboard = keyboard
 
     def _now(self):
@@ -235,7 +261,9 @@ class GuardedActionHandler:
         if action == "IDLE" or not _accepted(action, params):
             # For the experiment, every IDLE stops inputs, not just horizontal motion.
             self._heal_until = 0.0
+            self._command = None
             self.keyboard.halt()
+            self.keyboard.acknowledge_expired_grant()
             return
         if healing and not self._heal_in_progress():
             duration = HEAL_HOLD_SECONDS
@@ -246,17 +274,26 @@ class GuardedActionHandler:
         else:
             duration = None
             fresh_heal = False
+        signature = _command_signature(action, params)
+        if self._command is not None and signature != self._command:
+            # A new motor command must not inherit keys held by the previous one.
+            self.keyboard.halt()
         if not self.keyboard.arm(duration):
             # Expired lease: do not dispatch, and do not extend the deadline.
             self._heal_until = 0.0
+            self._command = None
             self.keyboard.halt()
+            self.keyboard.acknowledge_expired_grant()
             return
+        self._command = signature
         if fresh_heal:
             self._heal_until = self._now() + HEAL_HOLD_SECONDS
         try:
             self.handler.execute_behavior(action, params)
         except Exception:
             self._heal_until = 0.0
+            self._command = None
             self.keyboard.halt()
+            self.keyboard.acknowledge_expired_grant()
             raise
 

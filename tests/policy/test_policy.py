@@ -369,6 +369,11 @@ class IntegrationTests(unittest.TestCase):
         self.owner.platforms.insert(0, {"t_l": (0, 0), "b_r": (-1, 1)})
         with self.assertRaises(ValueError):
             ObservationBuilder().build(self.state, self.owner)
+    def test_missing_action_releases_instead_of_leaving_keys_down(self):
+        self.owner.bot_state = SimpleNamespace(handle=lambda state: (None, None))
+        bridge = self.bridge("fsm")
+        self.assertEqual(bridge.handle(self.state), stop_command())
+
     def test_nonfinite_coordinates_rejected(self):
         self.assertIsNone(point((float("nan"), 0)))
         self.assertIsNone(point((True, 0)))
@@ -577,6 +582,7 @@ class InputTests(unittest.TestCase):
         self.kb._key_down("left")
         self.assertEqual(self.kb.events, [])
         self.kb.halt()
+        self.assertFalse(self.kb.arm())
         self.assertTrue(self.kb.arm())
         self.kb._key_down("left")
         self.assertEqual(self.kb.events, [("down", "left")])
@@ -613,6 +619,42 @@ class InputTests(unittest.TestCase):
         self.clock.advance(HEAL_HOLD_SECONDS)
         handler.execute_behavior("IDLE", {"command": "RELEASE_ALL"})
         self.assertEqual(self.kb._pressed_keys, set())
+
+    def test_renewal_does_not_shorten_an_active_lease(self):
+        self.assertTrue(self.kb.arm(HEAL_HOLD_SECONDS))
+        deadline = self.kb._lease_until
+        self.clock.advance(0.2)
+        self.assertTrue(self.kb.arm())
+        self.assertEqual(self.kb._lease_until, deadline)
+        self.clock.advance(1.1)
+        self.kb._key_down("h")
+        self.assertEqual(self.kb.events, [("down", "h")])
+
+    def test_expired_halt_does_not_grant_on_the_same_attempt(self):
+        calls = []
+        handler = GuardedActionHandler(
+            SimpleNamespace(execute_behavior=lambda *args: calls.append(args)), self.kb)
+        self.assertTrue(self.kb.arm())
+        self.kb._key_down("left")
+        self.clock.advance(1.0)
+        self.kb.halt()
+        handler.execute_behavior("MOVE", {"direction": "RIGHT"})
+        self.assertEqual(calls, [])
+        self.assertEqual(self.kb._pressed_keys, set())
+        handler.execute_behavior("MOVE", {"direction": "RIGHT"})
+        self.assertEqual(calls, [("MOVE", {"direction": "RIGHT"})])
+
+    def test_different_motor_command_releases_held_keys(self):
+        calls = []
+        handler = GuardedActionHandler(
+            SimpleNamespace(execute_behavior=lambda *args: calls.append(args)), self.kb)
+        handler.execute_behavior("MOVE", {"direction": "LEFT"})
+        self.kb._key_down("left")
+        handler.execute_behavior("MOVE", {"direction": "LEFT"})
+        self.assertEqual(self.kb._pressed_keys, {"left"})
+        handler.execute_behavior("CLIMB", {"direction": "UP"})
+        self.assertEqual(self.kb._pressed_keys, set())
+        self.assertEqual(calls[-1], ("CLIMB", {"direction": "UP"}))
 
     def test_cancelled_heal_worker_cannot_clear_a_retried_hold(self):
         entered = threading.Event()
