@@ -28,6 +28,9 @@ class KeyboardLeaseMixin:
         self._lease_until = 0.0
         self._lease_epoch = 0
         self._grant_blocked = False
+        self._focus_losses = 0
+        self._focus_seen = 0
+        self._focus_down = False
         self._lease_local = threading.local()
         self._lease_closed = False
         self._lease_stop = threading.Event()
@@ -186,11 +189,33 @@ class KeyboardLeaseMixin:
     def release_all(self):
         self.halt()
 
+    def _focus_ok(self):
+        try:
+            return bool(self._lease_allowed())
+        except Exception:
+            return False
+
+    def _poll_lease(self):
+        with self._lease_lock:
+            # One count per focus-loss edge. The game loop consumes it and suspends
+            # even if focus has already returned before the next frame.
+            if self._focus_ok():
+                self._focus_down = False
+            elif not self._focus_down:
+                self._focus_losses += 1
+                self._focus_down = True
+            if not self._permitted():
+                self.halt()
+
+    def consume_focus_losses(self):
+        with self._lease_lock:
+            lost = self._focus_losses != self._focus_seen
+            self._focus_seen = self._focus_losses
+            return lost
+
     def _watch_lease(self):
         while not self._lease_stop.wait(0.025):
-            with self._lease_lock:
-                if not self._permitted():
-                    self.halt()
+            self._poll_lease()
 
     def close(self):
         with self._lease_lock:
@@ -217,11 +242,12 @@ def _is_heal(action, params):
 
 
 def _command_signature(action, params):
-    try:
-        items = tuple(sorted(params.items()))
-    except TypeError:
-        items = tuple(params.items())
-    return (action, items)
+    # Distance and target name change every frame. Including them restarts the
+    # attack worker and can suppress a short wind-up indefinitely.
+    if isinstance(params, dict) and isinstance(params.get("key"), str) and params.get("key"):
+        return (action, params["key"])
+    direction = params.get("direction") if isinstance(params, dict) else None
+    return (action, direction)
 
 
 def _accepted(action, params):

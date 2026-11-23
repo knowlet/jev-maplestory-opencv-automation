@@ -331,9 +331,11 @@ class AutoControlAdapter:
     inputs. Death discards a cancelled heal; the other stops retry it once
     before any tactic when control returns.
     """
-    def __init__(self, owner, bridge, *, allowed=lambda: True, halt=lambda: None):
+    def __init__(self, owner, bridge, *, allowed=lambda: True, halt=lambda: None,
+                 consume_focus_losses=lambda: False):
         self.owner, self.bridge = owner, bridge
         self.allowed, self.halt = allowed, halt
+        self.consume_focus_losses = consume_focus_losses
         self._retry_heal = None
         owner.bot_state = bridge
 
@@ -351,10 +353,19 @@ class AutoControlAdapter:
 
     def run(self, state):
         dead = percentage(state.player_hp) == 0
-        if (not self.allowed() or point(state.mini_player_loc) is None
+        try:
+            focus_lost = bool(self.consume_focus_losses())
+        except Exception:
+            focus_lost = True
+        if (focus_lost or not self.allowed() or point(state.mini_player_loc) is None
                 or point(state.player_center_loc) is None or dead):
             self.suspend(retry_heal=not dead)
             return stop_command()
+        # Finish the potion already in progress before the health manager can
+        # start the other bar and spend its cooldown.
+        held = self.bridge._held_heal()
+        if held is not None:
+            return held
         if self._retry_heal is not None:
             action = self._retry_heal
             self._retry_heal = None

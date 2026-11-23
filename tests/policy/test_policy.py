@@ -160,6 +160,19 @@ class SchedulerTests(unittest.TestCase):
         self.submit.complete()
         self.assertIsNone(self.tick())
 
+    def test_pre_pause_inflight_timeout_does_not_backoff(self):
+        self.tick()
+        self.policy.reset()
+        self.clock.advance(5)
+        self.assertIsNone(self.tick())
+        self.assertEqual(self.policy.errors, 0)
+        self.assertNotEqual(self.policy.last_status, "deadline")
+        self.assertLess(self.policy.next_request, self.clock.now)
+        self.submit.complete()
+        self.assertIsNone(self.tick())
+        self.assertEqual(self.policy.errors, 0)
+        self.assertEqual(len(self.submit.jobs), 2)
+
     def test_timeout_does_not_spawn_unbounded_workers(self):
         self.tick()
         self.clock.advance(1.1)
@@ -369,6 +382,42 @@ class IntegrationTests(unittest.TestCase):
         self.owner.platforms.insert(0, {"t_l": (0, 0), "b_r": (-1, 1)})
         with self.assertRaises(ValueError):
             ObservationBuilder().build(self.state, self.owner)
+    def test_hp_hold_is_not_replaced_by_an_mp_heal(self):
+        potions = [("HEAL_HP", {"key": "h"}), ("HEAL_MP", {"key": "m"})]
+
+        def run(state):
+            self.owner.run_calls += 1
+            return potions[self.owner.run_calls - 1]
+
+        self.owner.run = run
+        adapter = AutoControlAdapter(self.owner, self.bridge("jev"))
+        self.assertEqual(adapter.run(self.state), potions[0])
+        started = self.owner.run_calls
+        self.clock.advance(0.5)
+        self.assertEqual(adapter.run(self.state), potions[0])
+        self.assertEqual(self.owner.run_calls, started)
+        self.clock.advance(HEAL_HOLD_SECONDS)
+        self.assertEqual(adapter.run(self.state), potions[1])
+        self.assertEqual(self.owner.run_calls, started + 1)
+
+    def test_focus_loss_between_frames_suspends_before_cached_decision(self):
+        seen = {"n": 1}
+
+        def consume():
+            lost = seen["n"]
+            seen["n"] = 0
+            return lost
+
+        halts = []
+        adapter = AutoControlAdapter(self.owner, self.bridge("jev"),
+                                     halt=lambda: halts.append(1),
+                                     consume_focus_losses=consume)
+        self.owner.health = ("ATTACK", {"direction": "LEFT", "name": "slime", "distance": 4})
+        self.assertEqual(adapter.run(self.state), stop_command())
+        self.assertEqual(self.owner.run_calls, 0)
+        self.assertEqual(halts, [1])
+        self.assertEqual(adapter.run(self.state)[0], "ATTACK")
+
     def test_missing_action_releases_instead_of_leaving_keys_down(self):
         self.owner.bot_state = SimpleNamespace(handle=lambda state: (None, None))
         bridge = self.bridge("fsm")
@@ -643,6 +692,36 @@ class InputTests(unittest.TestCase):
         self.assertEqual(self.kb._pressed_keys, set())
         handler.execute_behavior("MOVE", {"direction": "RIGHT"})
         self.assertEqual(calls, [("MOVE", {"direction": "RIGHT"})])
+
+    def test_attack_target_jitter_does_not_cancel_the_windup(self):
+        calls = []
+        handler = GuardedActionHandler(
+            SimpleNamespace(execute_behavior=lambda *args: calls.append(args)), self.kb)
+        handler.execute_behavior("ATTACK", {"name": "slime", "distance": 12.0, "direction": "LEFT"})
+        epoch = self.kb._lease_epoch
+        self.kb._key_down("attack")
+        handler.execute_behavior("ATTACK", {"name": "slime", "distance": 11.0, "direction": "LEFT"})
+        self.assertEqual(self.kb._lease_epoch, epoch)
+        self.assertIn("attack", self.kb._pressed_keys)
+        self.assertEqual(len(calls), 2)
+        handler.execute_behavior("ATTACK", {"name": "slime", "distance": 11.0, "direction": "RIGHT"})
+        self.assertNotIn("attack", self.kb._pressed_keys)
+        self.assertGreater(self.kb._lease_epoch, epoch)
+
+    def test_focus_loss_is_counted_once_per_edge_and_consumed(self):
+        allowed = {"ok": True}
+        keyboard = Keyboard(allowed=lambda: allowed["ok"], clock=self.clock, watchdog=False)
+        try:
+            keyboard._poll_lease()
+            self.assertFalse(keyboard.consume_focus_losses())
+            allowed["ok"] = False
+            keyboard._poll_lease()
+            keyboard._poll_lease()
+            allowed["ok"] = True
+            self.assertTrue(keyboard.consume_focus_losses())
+            self.assertFalse(keyboard.consume_focus_losses())
+        finally:
+            keyboard.close()
 
     def test_different_motor_command_releases_held_keys(self):
         calls = []

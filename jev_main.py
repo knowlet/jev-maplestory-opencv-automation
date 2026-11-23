@@ -67,6 +67,7 @@ def main(argv=None):
                 self.auto_control, self.bridge,
                 allowed=lambda: self.active() and self.loss_tracking_count == 0,
                 halt=self.keyboard.halt,
+                consume_focus_losses=self.keyboard.consume_focus_losses,
             )
             # Require F9 to start; do not begin sending keys when a new launcher opens.
             self.bot_enabled = False

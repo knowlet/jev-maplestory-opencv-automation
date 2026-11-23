@@ -123,8 +123,15 @@ heal hold is still in progress (see below). Entering a Jev tactic, switching
 to a different Jev tactic, or leaving one — `IDLE`, a frame with no decision, a
 skill that returns no action, or reset — releases every tracked key. Repeating
 the same Jev tactic does not. A different motor command releases tracked keys before it
-runs; repeating the same command may keep holding them. A missing action is
-returned as `IDLE`, so the loop releases keys instead of leaving them down.
+runs. The command identity is the action plus its direction or potion key, so a
+target's distance or name can change without cancelling an attack. Repeating
+that command may keep holding its keys. A missing action is returned as `IDLE`,
+so the loop releases keys instead of leaving them down. A focus loss seen by
+the input watchdog is counted even if focus has returned by the next frame; the
+game loop consumes that count and suspends before using a cached decision. An
+in-progress heal is returned before the health manager runs again, so a second
+low bar does not start until the first hold finishes. A request still running
+from before a pause is not charged as a deadline failure after resume.
 
 Healing stays outside Jev and outranks tactics. After a valid heal command, the
 controller keeps returning that heal for the upstream potion-key hold (3 seconds,

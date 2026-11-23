@@ -122,7 +122,12 @@ class JevPolicy:
                         self._failure(str(exc) if isinstance(exc, JevError) else "client_error", now)
             elif not pending.expired and now - pending.started > self.settings.timeout:
                 pending.expired = True
-                self._failure("deadline", now)
+                # A request from before pause belongs to an older epoch. Do not
+                # spend the current epoch's deadline penalty or backoff on it.
+                if pending.epoch == self.epoch:
+                    self._failure("deadline", now)
+                else:
+                    self.last_status = "discarded_epoch_or_deadline"
         if self.cached:
             decision, observed_at, cached_context, request_id = self.cached
             if (now - observed_at > self.settings.max_age or cached_context != context
