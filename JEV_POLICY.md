@@ -129,7 +129,12 @@ that command may keep holding its keys. A missing action is returned as `IDLE`,
 so the loop releases keys instead of leaving them down. A focus loss seen by
 the input watchdog is counted even if focus has returned by the next frame; the
 game loop consumes that count and suspends before using a cached decision. Until
-that count is consumed, `arm` will not grant a lease. An in-progress heal is
+that count is consumed, `arm` will not grant a lease. Suspension reads that
+timestamp before it clears a heal, and the earliest unconsumed loss is kept.
+A worker target is bound to the generation captured with the grant. A key the
+driver fails to release stays pending, blocks a new lease, and is retried by
+the watchdog. A cancelled potion worker cannot claim the next item hold. An
+in-progress heal is
 returned before the health manager runs again, so a second low bar does not
 start until the first hold finishes. If inputs are cut off before that deadline,
 the heal is replayed from the interrupt time even when the loop resumes later.

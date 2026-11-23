@@ -351,6 +351,15 @@ class AutoControlAdapter:
         return self.owner.get_debug_geometry()
 
     def suspend(self, *, retry_heal=True, interrupted_at=None):
+        # Foreground and window hooks suspend before run() consumes the loss.
+        # Read that timestamp first, and keep the earliest one.
+        try:
+            loss_at = self.consume_focus_losses()
+        except Exception:
+            loss_at = None
+        if type(loss_at) in (int, float) and not isinstance(loss_at, bool):
+            if interrupted_at is None or loss_at < interrupted_at:
+                interrupted_at = loss_at
         pending = self.bridge.interrupt_heal(interrupted_at=interrupted_at)
         if not retry_heal:
             self._retry_heal = None

@@ -32,6 +32,9 @@ class KeyboardLeaseMixin:
         self._focus_seen = 0
         self._focus_down = False
         self._focus_lost_at = None
+        self._pending_releases = []
+        self._pinned_epoch = None
+        self._last_grant_epoch = 0
         self._lease_local = threading.local()
         self._lease_closed = False
         self._lease_stop = threading.Event()
@@ -44,7 +47,8 @@ class KeyboardLeaseMixin:
     def __getattribute__(self, name):
         value = super().__getattribute__(name)
         if name.endswith("_command") and callable(value):
-            epoch = super().__getattribute__("_lease_epoch")
+            pinned = super().__getattribute__("_pinned_epoch")
+            epoch = pinned if pinned is not None else super().__getattribute__("_lease_epoch")
             @functools.wraps(value)
             def generation_bound(*args, **kwargs):
                 local = self._lease_local
@@ -75,18 +79,29 @@ class KeyboardLeaseMixin:
         return lock
 
     def _begin_item_hold(self):
-        """Give this potion press its own token. A busy hold is not shared."""
+        """Give this potion press its own token. A busy hold is not shared.
+
+        The worker's captured generation and the live lease are checked under
+        the same lock halt() holds, so a cancelled worker cannot claim the
+        token and block a retry for the upstream potion sleep.
+        """
         lock = self._item_state_lock()
         if lock is None:
             return None
-        with lock:
-            if getattr(self, "_item_owner_token", None) is not None:
+        with self._lease_lock:
+            bound = getattr(self._lease_local, "epoch", None)
+            if bound != self._lease_epoch or self._lease_closed:
                 return None
-            token = getattr(self, "_item_hold_serial", 0) + 1
-            self._item_hold_serial = token
-            self._item_owner_token = token
-            self._status_item = True
-            return token
+            if not (self._lease_clock() < self._lease_until):
+                return None
+            with lock:
+                if getattr(self, "_item_owner_token", None) is not None:
+                    return None
+                token = getattr(self, "_item_hold_serial", 0) + 1
+                self._item_hold_serial = token
+                self._item_owner_token = token
+                self._status_item = True
+                return token
 
     def _finish_item_worker(self, token):
         """One locked update: clear the flag only if this hold still owns it."""
@@ -133,6 +148,9 @@ class KeyboardLeaseMixin:
             # A focus loss the game loop has not consumed yet must not be re-armed.
             if self._focus_losses != self._focus_seen:
                 return False
+            # A key the driver failed to release must not stay down under a new lease.
+            if self._pending_releases:
+                return False
             now = self._lease_clock()
             if self._grant_blocked:
                 self._grant_blocked = False
@@ -148,12 +166,25 @@ class KeyboardLeaseMixin:
             proposed = now + duration
             if proposed > self._lease_until:
                 self._lease_until = proposed
+            self._last_grant_epoch = self._lease_epoch
+            # Same critical section as the grant, so a halt cannot slip in
+            # before worker targets are bound to this generation.
+            self._pinned_epoch = self._lease_epoch
             return True
 
     def acknowledge_expired_grant(self):
         """The rejected attempt has finished. The following attempt may grant."""
         with self._lease_lock:
             self._grant_blocked = False
+
+    def pin_granted_dispatch(self):
+        """Bind later worker-target lookups to the epoch captured with the grant."""
+        with self._lease_lock:
+            self._pinned_epoch = self._last_grant_epoch
+
+    def unpin_dispatch(self):
+        with self._lease_lock:
+            self._pinned_epoch = None
 
     def _key_down(self, key):
         with self._lease_lock:
@@ -193,16 +224,36 @@ class KeyboardLeaseMixin:
             # an upstream timed movement worker may hold it while sleeping.
             # One driver failure must not skip the rest or escape into the watchdog.
             failed = []
-            for key in keys:
+            release_keys = list(keys)
+            for key in self._pending_releases:
+                if key not in release_keys:
+                    release_keys.append(key)
+            for key in release_keys:
                 try:
                     super()._key_up(key)
                 except Exception:
                     failed.append(key)
+            self._pending_releases = failed
             if failed:
                 with self._pressed_keys_lock:
                     for key in failed:
                         self._pressed_keys.add(key)
             self._cancel_item_hold()
+
+    def _retry_pending_releases(self):
+        """Caller holds the lease lock. Retry even when the lease is still valid."""
+        if not self._pending_releases:
+            return
+        still = []
+        for key in list(self._pending_releases):
+            try:
+                super()._key_up(key)
+            except Exception:
+                still.append(key)
+            else:
+                with self._pressed_keys_lock:
+                    self._pressed_keys.discard(key)
+        self._pending_releases = still
 
     def release_all(self):
         self.halt()
@@ -213,17 +264,32 @@ class KeyboardLeaseMixin:
         except Exception:
             return False
 
+    def _record_focus(self, focused):
+        # One count per focus-loss edge. Keep the earliest unconsumed time.
+        if focused:
+            self._focus_down = False
+            return
+        if not self._focus_down:
+            self._focus_losses += 1
+            self._focus_down = True
+            if self._focus_lost_at is None:
+                self._focus_lost_at = self._lease_clock()
+
+    def _permitted_focused(self, focused):
+        try:
+            return (not self._lease_closed and self._lease_clock() < self._lease_until
+                    and getattr(self._lease_local, "epoch", self._lease_epoch) == self._lease_epoch
+                    and focused)
+        except Exception:
+            return False
+
     def _poll_lease(self):
         with self._lease_lock:
-            # One count per focus-loss edge. The game loop consumes it and suspends
-            # even if focus has already returned before the next frame.
-            if self._focus_ok():
-                self._focus_down = False
-            elif not self._focus_down:
-                self._focus_losses += 1
-                self._focus_down = True
-                self._focus_lost_at = self._lease_clock()
-            if not self._permitted():
+            # Sample focus once. A second sample can halt without recording the loss.
+            focused = self._focus_ok()
+            self._record_focus(focused)
+            self._retry_pending_releases()
+            if not self._permitted_focused(focused):
                 self.halt()
 
     def consume_focus_losses(self):
@@ -232,7 +298,9 @@ class KeyboardLeaseMixin:
             if self._focus_losses == self._focus_seen:
                 return None
             self._focus_seen = self._focus_losses
-            return self._focus_lost_at
+            lost_at = self._focus_lost_at
+            self._focus_lost_at = None
+            return lost_at
 
     def _watch_once(self):
         try:
@@ -310,6 +378,7 @@ class GuardedActionHandler:
         if self._heal_in_progress() and not healing:
             # Tactical and idle commands must not release the potion key.
             self.keyboard.arm(self._heal_until - self._now())
+            self.keyboard.unpin_dispatch()
             return
         if action == "IDLE" or not _accepted(action, params):
             # For the experiment, every IDLE stops inputs, not just horizontal motion.
@@ -338,6 +407,9 @@ class GuardedActionHandler:
             self.keyboard.halt()
             self.keyboard.acknowledge_expired_grant()
             return
+        # Worker targets looked up below stay bound to this grant, even if the
+        # watchdog halts before the lookup.
+        self.keyboard.pin_granted_dispatch()
         self._command = signature
         if fresh_heal:
             self._heal_until = self._now() + HEAL_HOLD_SECONDS
@@ -349,4 +421,6 @@ class GuardedActionHandler:
             self.keyboard.halt()
             self.keyboard.acknowledge_expired_grant()
             raise
+        finally:
+            self.keyboard.unpin_dispatch()
 

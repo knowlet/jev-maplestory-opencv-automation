@@ -400,6 +400,36 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(adapter.run(self.state), potions[1])
         self.assertEqual(self.owner.run_calls, started + 1)
 
+    def test_hook_suspend_keeps_the_earliest_focus_loss_for_the_heal(self):
+        def run(state):
+            self.owner.run_calls += 1
+            if self.owner.run_calls == 1:
+                return ("HEAL_HP", {"key": "h"})
+            return ("ATTACK", {"direction": "LEFT"})
+
+        self.owner.run = run
+        allowed = {"ok": True}
+        keyboard = Keyboard(allowed=lambda: allowed["ok"], clock=self.clock, watchdog=False)
+        try:
+            adapter = AutoControlAdapter(
+                self.owner, self.bridge("jev"), halt=keyboard.halt,
+                consume_focus_losses=keyboard.consume_focus_losses)
+            self.assertEqual(adapter.run(self.state), ("HEAL_HP", {"key": "h"}))
+            self.clock.advance(0.3)
+            allowed["ok"] = False
+            keyboard._poll_lease()
+            allowed["ok"] = True
+            keyboard._poll_lease()
+            self.clock.advance(5)
+            allowed["ok"] = False
+            keyboard._poll_lease()
+            adapter.suspend()
+            self.assertEqual(adapter._retry_heal, ("HEAL_HP", {"key": "h"}))
+            self.assertEqual(adapter.run(self.state), ("HEAL_HP", {"key": "h"}))
+            self.assertEqual(self.owner.run_calls, 1)
+        finally:
+            keyboard.close()
+
     def test_cut_short_heal_is_replayed_after_a_long_stall(self):
         def run(state):
             self.owner.run_calls += 1
@@ -821,6 +851,108 @@ class InputTests(unittest.TestCase):
             keyboard._item_command("p")
             self.assertEqual(started, ["h", "p"])
             self.assertNotEqual(keyboard._item_hold_serial, 1)
+        finally:
+            keyboard.close()
+
+    def test_worker_bound_to_grant_cannot_press_under_the_next_lease(self):
+        calls = []
+
+        def execute(action, params):
+            calls.append((action, params))
+            self.kb.halt()
+            self.kb._late_worker = self.kb._attack_command
+
+        handler = GuardedActionHandler(SimpleNamespace(execute_behavior=execute), self.kb)
+        handler.execute_behavior("ATTACK", {"direction": "LEFT"})
+        self.assertEqual(len(calls), 1)
+        self.kb.acknowledge_expired_grant()
+        self.assertTrue(self.kb.arm())
+        self.kb._late_worker()
+        self.assertNotIn(("down", "attack"), self.kb.events)
+
+    def test_failed_release_blocks_grant_until_watchdog_retries(self):
+        class Base:
+            def __init__(self):
+                self.events = []
+                self._pressed_keys = set()
+                self._pressed_keys_lock = threading.Lock()
+                self._current_move = None
+                self.fail = {"left"}
+
+            def _key_down(self, key):
+                self.events.append(("down", key))
+                self._pressed_keys.add(key)
+
+            def _key_up(self, key):
+                if key in self.fail:
+                    raise RuntimeError("driver")
+                self.events.append(("up", key))
+                self._pressed_keys.discard(key)
+
+        class Flaky(KeyboardLeaseMixin, Base):
+            pass
+
+        keyboard = Flaky(allowed=lambda: True, clock=self.clock, watchdog=False)
+        try:
+            self.assertTrue(keyboard.arm())
+            keyboard._key_down("left")
+            keyboard.halt()
+            self.assertIn("left", keyboard._pressed_keys)
+            self.assertFalse(keyboard.arm())
+            keyboard.fail.clear()
+            keyboard._lease_until = self.clock.now + 5
+            keyboard._poll_lease()
+            self.assertNotIn("left", keyboard._pressed_keys)
+            self.assertEqual(keyboard._pending_releases, [])
+            self.assertTrue(keyboard.arm())
+        finally:
+            keyboard.close()
+
+    def test_cancelled_potion_worker_does_not_claim_the_next_hold(self):
+        ran = []
+
+        class ItemKeyboard(Keyboard):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self._item_lock = threading.Lock()
+                self._status_item = False
+
+            def _item_command(self, key):
+                ran.append(key)
+                self._key_down(key)
+
+        keyboard = ItemKeyboard(allowed=lambda: True, clock=self.clock, watchdog=False)
+        try:
+            self.assertTrue(keyboard.arm())
+            stale = keyboard._item_command
+            keyboard.halt()
+            self.assertTrue(keyboard.arm())
+            stale("h")
+            self.assertEqual(ran, [])
+            self.assertFalse(keyboard._status_item)
+            self.assertIsNone(keyboard._item_owner_token)
+        finally:
+            keyboard.close()
+
+    def test_poll_uses_one_focus_sample_for_loss_and_halt(self):
+        calls = {"n": 0}
+
+        def allowed():
+            calls["n"] += 1
+            # key_down uses sample 1. The poll's sample is 2; a second poll
+            # sample would be 3 and would say focus is gone.
+            return calls["n"] < 3
+
+        keyboard = Keyboard(allowed=allowed, clock=self.clock, watchdog=False)
+        try:
+            self.assertTrue(keyboard.arm())
+            keyboard._key_down("left")
+            keyboard._poll_lease()
+            self.assertEqual(calls["n"], 2)
+            if "left" not in keyboard._pressed_keys:
+                self.assertIsNotNone(keyboard.consume_focus_losses())
+            else:
+                self.assertIsNone(keyboard.consume_focus_losses())
         finally:
             keyboard.close()
 
